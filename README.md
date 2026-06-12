@@ -15,16 +15,17 @@ This MCP (Model Context Protocol) server gives AI agents the ability to interact
 | Tool | Description |
 |------|-------------|
 | `booking_status` | Check login/session status |
-| `booking_login` | Initiate login flow (returns URL for manual login) |
+| `booking_login` | Open a browser window to sign in (non-blocking; returns immediately) |
+| `booking_login_status` | Check progress of an in-flight `booking_login` |
 | `booking_logout` | Clear saved session and cookies |
-| `booking_search` | Search hotels by destination, dates, guests, rooms |
-| `booking_get_property` | Get property details (amenities, description, policies) |
+| `booking_search` | Search hotels by destination, dates, guests, rooms, and amenities (pets, parking, pool, …) |
+| `booking_get_property` | Get property details (amenities, description, policies, structured `facilitySummary`) |
 | `booking_check_availability` | Check room availability for specific dates |
 | `booking_get_prices` | Get pricing for a property |
 | `booking_filter_results` | Filter last search by price, rating, amenities |
 | `booking_sort_results` | Sort last search by price/rating/distance/reviews |
 | `booking_save_property` | Save to wishlist/favorites |
-| `booking_book` | Book a room (requires `confirm=true`) |
+| `booking_book` | Get a "continue in your browser" booking link (does not place the booking) |
 | `booking_get_reservations` | List current/upcoming reservations |
 | `booking_cancel_reservation` | Cancel a booking (requires `confirm=true`) |
 | `booking_get_reviews` | Get guest reviews for a property |
@@ -63,11 +64,28 @@ Add to your MCP config (e.g. `~/.claude/mcp_servers.json`):
 
 ## Authentication
 
-The server uses cookie-based session persistence. Cookies are stored at `~/.strider/booking/`.
+The server uses cookie-based session persistence. Login is **non-blocking** (two
+steps) so it won't hang your MCP client while you wait on an emailed verification
+code:
 
-1. Run `booking_login` to get the login URL
-2. Open the URL in your browser and sign in
-3. Run `booking_status` to verify the session is active
+1. Run `booking_login`. It opens a **visible browser window** at the Booking.com sign-in page and returns immediately.
+2. Sign in in that window (including any email/SMS code or 2FA/CAPTCHA). A background poller watches for completion.
+3. Run `booking_login_status` to check progress — it reports `in_progress`, `success`, `failed`, or `idle`. Poll it until it's no longer `in_progress`.
+4. On `success` the session is captured and saved automatically; `booking_status` will then show you as logged in.
+
+The background poller waits up to ~10 min by default; pass `timeoutSeconds` to
+`booking_login` to extend it (up to 30 min) if a verification code is slow to
+arrive. If the window is closed or the deadline passes before sign-in completes,
+the status becomes `failed` and the window is cleaned up — just call
+`booking_login` again.
+
+Because login drives a real browser window, it requires **Google Chrome installed and a desktop display** — it cannot run on a headless server.
+
+### Cookie storage
+
+- Session cookies are stored at `~/.strider/booking/cookies.json`, scoped to **Booking.com domains only** (unrelated third-party/tracking cookies are not persisted).
+- The config directory (`0700`) and the cookie/session files (`0600`) are created with owner-only permissions. The files are **not encrypted** — protect your home directory accordingly.
+- `booking_logout` deletes the saved cookies and session.
 
 ## Usage Examples
 
@@ -76,6 +94,21 @@ The server uses cookie-based session persistence. Cookies are stored at `~/.stri
 ```
 booking_search(destination="Paris", checkIn="2026-06-01", checkOut="2026-06-05", adults=2, rooms=1)
 ```
+
+### Search by amenities (pets, parking, pool, …)
+
+Amenity filters are applied **server-side** via Booking.com's `nflt` parameter, so results only contain matching properties.
+
+```
+# Pet-friendly hotels with parking and a pool
+booking_search(destination="Rome", checkIn="2026-06-01", checkOut="2026-06-05", amenities=["pets", "parking", "pool"])
+```
+
+Supported amenity keys: `pets`, `parking`, `pool`, `restaurant`, `room_service`, `front_desk_24h`, `fitness`, `non_smoking`, `airport_shuttle`, `family_rooms`, `ev_charging`, `spa`, `hot_tub`, `sauna`, `free_wifi`, `air_conditioning`.
+
+For a single property, `booking_get_property` returns a structured `facilitySummary` (e.g. `petsAllowed`, `parking`, `pool`, `spa`) where `true` = offered/allowed, `false` = not allowed, `null` = not mentioned on the page.
+
+> Note: amenity → filter codes are reverse-engineered from Booking.com's UI (undocumented but stable). If a filter behaves unexpectedly, supply an exact chip via `rawNflt` (e.g. `rawNflt="hotelfacility=4;popular_activities=2"`).
 
 ### Filter and sort results
 
@@ -93,26 +126,38 @@ booking_get_prices(propertyUrl="...", checkIn="2026-06-01", checkOut="2026-06-05
 
 ### Book a room
 
+`booking_book` does **not** place a booking. Booking.com checkout is a multi-step
+wizard (room selection → guest contact details → payment) that can't be reliably
+completed via automation, so this returns a `bookingUrl` to finish in a browser.
+
 ```
-# Preview first (no confirm flag)
+# Returns a bookingUrl (property page with dates/occupancy pre-filled,
+# opening on the room list with "Reserve" buttons) to complete in a browser.
 booking_book(propertyUrl="...", checkIn="2026-06-01", checkOut="2026-06-05", adults=2)
 
-# Confirm booking (only after explicit user approval)
-booking_book(propertyUrl="...", checkIn="2026-06-01", checkOut="2026-06-05", adults=2, confirm=true)
+# Optional: also best-effort capture a deeper checkoutUrl with the first
+# available room pre-selected (still stops before any guest/payment details).
+booking_book(propertyUrl="...", checkIn="2026-06-01", checkOut="2026-06-05", adults=2, advanceToCheckout=true)
 ```
 
 ### Manage reservations
 
 ```
+# List current/upcoming reservations. Each result's reservationId is the trip id
+# (or "<tripId>-<n>" for a specific booking within a multi-booking trip).
 booking_get_reservations()
-booking_cancel_reservation(reservationId="12345678", confirm=true)
+
+# Cancel walks Booking.com's multi-step flow: confirmation page -> "Cancel your
+# booking" -> reason survey (Step 1 of 2) -> final confirm (Step 2). The final
+# step is irreversible, so it only runs with confirm=true.
+booking_cancel_reservation(reservationId="308612662158023")           # no-op preview
+booking_cancel_reservation(reservationId="308612662158023", confirm=true)  # actually cancels
 ```
 
 ## Safety
 
-- `booking_book` requires `confirm=true` and should only be called with explicit user confirmation
-- `booking_cancel_reservation` requires `confirm=true` and is irreversible
-- Both tools return a preview/warning when called without the confirm flag
+- `booking_book` never places a booking — it returns a link to complete checkout (contact details + payment) in a browser
+- `booking_cancel_reservation` requires `confirm=true`; without it, it returns a no-op warning and never opens a browser. With it, it drives the multi-step cancel flow (reason survey + final confirm) and the last step is irreversible
 
 ## Development
 

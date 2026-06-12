@@ -17,7 +17,8 @@ import {
 
 import {
   checkLoginStatus,
-  initiateLogin,
+  startLogin,
+  getLoginProgress,
   searchProperties,
   getPropertyDetails,
   checkAvailability,
@@ -30,6 +31,7 @@ import {
   cancelReservation,
   getPropertyReviews,
   closeBrowser,
+  SUPPORTED_AMENITIES,
 } from "./browser.js";
 import { loadSessionInfo, clearAuthData, getConfigDir } from "./auth.js";
 
@@ -62,7 +64,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "booking_login",
         description:
-          "Initiate Booking.com login flow. Returns a URL and instructions for the user to complete login manually. After logging in, use booking_status to verify.",
+          "Start an interactive Booking.com login. Opens a VISIBLE browser window at the sign-in page and returns " +
+          "IMMEDIATELY (non-blocking) — sign-in runs in the background, so this won't hang the client while the user " +
+          "waits on an emailed/SMS code, 2FA or CAPTCHA. The user completes sign-in in that window, then you call " +
+          "booking_login_status to confirm the session was captured. Requires Google Chrome and a desktop display " +
+          "(cannot run on a headless server).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            timeoutSeconds: {
+              type: "number",
+              description:
+                "How long the background poller waits for sign-in to complete before giving up and closing the window, " +
+                "in seconds (default: 600 = 10 min, max: 1800 = 30 min). Increase if email/SMS verification codes are slow.",
+            },
+          },
+        },
+      },
+      {
+        name: "booking_login_status",
+        description:
+          "Check the progress of an interactive login started with booking_login. Returns status 'in_progress' " +
+          "(window still open, awaiting sign-in), 'success' (session captured and saved — other booking_* tools will " +
+          "reuse it), 'failed' (window closed or timed out before completing), or 'idle' (no login started). " +
+          "Poll this after calling booking_login until the status is no longer 'in_progress'.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -80,7 +105,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "booking_search",
         description:
-          "Search for hotels and properties on Booking.com. Returns property names, ratings, prices, and availability indicators.",
+          "Search for hotels and properties on Booking.com. Returns property names, ratings, prices, and availability indicators. " +
+          "Optionally filter server-side by amenities/facilities (e.g. pets, parking, pool) so only matching properties are returned.",
         inputSchema: {
           type: "object",
           properties: {
@@ -113,6 +139,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Maximum results to return (default: 10, max: 50)",
             },
+            amenities: {
+              type: "array",
+              items: {
+                type: "string",
+                enum: SUPPORTED_AMENITIES,
+              },
+              description:
+                "Filter results server-side to properties offering ALL of these amenities/facilities. " +
+                `Supported: ${SUPPORTED_AMENITIES.join(", ")}. ` +
+                "Example: [\"pets\", \"parking\", \"pool\"] for pet-friendly hotels with parking and a pool.",
+            },
+            rawNflt: {
+              type: "string",
+              description:
+                "Advanced/escape hatch: raw Booking.com `nflt` filter chips, ';'-delimited " +
+                "(e.g. 'hotelfacility=4;popular_activities=2'). Merged with `amenities`. " +
+                "Use when an amenity code needs correcting or for filters not in the amenities list.",
+            },
           },
           required: ["destination", "checkIn", "checkOut"],
         },
@@ -120,7 +164,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "booking_get_property",
         description:
-          "Get detailed information about a specific property, including amenities, description, policies, and photos.",
+          "Get detailed information about a specific property, including amenities, description, photos, raw policies, " +
+          "and a structured `facilitySummary` (parking, pool, fitness, spa, airConditioning, freeWifi, etc.). " +
+          "Facility fields are `true` when the amenity is found on the page or `null` when not mentioned. " +
+          "`petsAllowed` is the only tri-state field: `true` (allowed), `false` (explicitly not allowed), or `null` (not mentioned); " +
+          "`petsPolicy` carries the raw pet-policy text when present.",
         inputSchema: {
           type: "object",
           properties: {
@@ -198,7 +246,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "booking_filter_results",
         description:
-          "Filter the most recent booking_search results by price, rating, amenities, or keywords. Returns a filtered subset.",
+          "Client-side filter over the most recent booking_search results by price, review score, star rating, " +
+          "free cancellation, breakfast, or a name/location keyword. Returns a filtered subset. " +
+          "To filter by facilities like pets, parking, or pool, use the `amenities` argument on booking_search instead (filtered server-side).",
         inputSchema: {
           type: "object",
           properties: {
@@ -268,7 +318,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "booking_book",
         description:
-          "Book a room at a property. IMPORTANT: Set confirm=true only when you have explicit user confirmation. Without confirm=true, returns a preview instead of placing the booking.",
+          "Get a 'continue in your browser' link to book a room. Booking.com checkout is a multi-step wizard " +
+          "(room selection, guest contact details, then payment) that cannot be reliably completed via automation, " +
+          "so this NEVER places a booking. It returns a bookingUrl (the property page with dates/occupancy pre-filled, " +
+          "opening directly on the room list with Reserve buttons) for the user to finish by hand. " +
+          "Set advanceToCheckout=true to also best-effort capture a deeper checkoutUrl with the first available room pre-selected.",
         inputSchema: {
           type: "object",
           properties: {
@@ -292,10 +346,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Number of rooms (default: 1)",
             },
-            confirm: {
+            advanceToCheckout: {
               type: "boolean",
               description:
-                "Set to true to actually place the booking. If false or omitted, returns a preview. NEVER set to true without explicit user confirmation.",
+                "If true, best-effort: select the first available room and capture a deeper checkoutUrl (still stops before any guest/payment details). If false or omitted, only the property+dates bookingUrl is returned.",
             },
           },
           required: ["propertyUrl", "checkIn", "checkOut"],
@@ -313,14 +367,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "booking_cancel_reservation",
         description:
-          "Cancel an existing reservation. IMPORTANT: Set confirm=true only when you have explicit user confirmation. This action cannot be undone.",
+          "Cancel an existing reservation. Walks Booking.com's multi-step cancel flow " +
+          "(confirmation page, reason survey, final confirm). IMPORTANT: Set confirm=true " +
+          "only with explicit user confirmation — the final step is irreversible. Without " +
+          "confirm=true it returns a no-op warning and never opens a browser.",
         inputSchema: {
           type: "object",
           properties: {
             reservationId: {
               type: "string",
               description:
-                "The reservation/booking ID from booking_get_reservations",
+                "The reservationId from booking_get_reservations (the trip id, or " +
+                "'<tripId>-<n>' for a specific booking in a multi-booking trip). A full " +
+                "confirmation/detail URL is also accepted.",
             },
             confirm: {
               type: "boolean",
@@ -388,7 +447,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "booking_login": {
-        const result = await initiateLogin();
+        const { timeoutSeconds } = args as { timeoutSeconds?: number };
+        const timeoutMs =
+          typeof timeoutSeconds === "number" && timeoutSeconds > 0
+            ? Math.min(Math.max(timeoutSeconds, 30), 1800) * 1000
+            : undefined;
+        const progress = await startLogin(timeoutMs);
 
         return {
           content: [
@@ -396,12 +460,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: "text",
               text: JSON.stringify(
                 {
-                  success: true,
-                  ...result,
+                  ...progress,
+                  nextStep:
+                    progress.status === "in_progress"
+                      ? "Ask the user to finish signing in, then call booking_login_status to confirm."
+                      : undefined,
                 },
                 null,
                 2
               ),
+            },
+          ],
+        };
+      }
+
+      case "booking_login_status": {
+        const progress = getLoginProgress();
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(progress, null, 2),
             },
           ],
         };
@@ -433,6 +513,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           rooms = 1,
           children = 0,
           maxResults = 10,
+          amenities,
+          rawNflt,
         } = args as {
           destination: string;
           checkIn: string;
@@ -441,6 +523,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           rooms?: number;
           children?: number;
           maxResults?: number;
+          amenities?: string[];
+          rawNflt?: string;
         };
 
         const properties = await searchProperties(
@@ -450,7 +534,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           adults,
           rooms,
           children,
-          Math.min(maxResults, 50)
+          Math.min(maxResults, 50),
+          amenities,
+          rawNflt
         );
 
         return {
@@ -465,6 +551,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   checkOut,
                   adults,
                   rooms,
+                  amenities: amenities && amenities.length ? amenities : undefined,
                   count: properties.length,
                   properties,
                 },
@@ -668,43 +755,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           checkOut,
           adults = 2,
           rooms = 1,
-          confirm = false,
+          advanceToCheckout = false,
         } = args as {
           propertyUrl: string;
           checkIn: string;
           checkOut: string;
           adults?: number;
           rooms?: number;
-          confirm?: boolean;
+          advanceToCheckout?: boolean;
         };
-
-        if (!confirm) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  {
-                    success: true,
-                    requiresConfirmation: true,
-                    preview: {
-                      propertyUrl,
-                      checkIn,
-                      checkOut,
-                      adults,
-                      rooms,
-                    },
-                    message:
-                      "Booking not placed. To proceed, call booking_book with confirm=true. " +
-                      "IMPORTANT: Only do this after getting explicit user confirmation.",
-                  },
-                  null,
-                  2
-                ),
-              },
-            ],
-          };
-        }
 
         const result = await bookRoom(
           propertyUrl,
@@ -712,14 +771,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           checkOut,
           adults,
           rooms,
-          true
+          advanceToCheckout
         );
 
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ success: true, ...result }, null, 2),
+              text: JSON.stringify({ ...result }, null, 2),
             },
           ],
         };
@@ -758,14 +817,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  success: result.success,
-                  message: result.message,
-                },
-                null,
-                2
-              ),
+              text: JSON.stringify({ ...result }, null, 2),
             },
           ],
         };
