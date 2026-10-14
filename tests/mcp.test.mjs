@@ -14,6 +14,19 @@ test("MCP exposes child ages and forwards occupancy to booking links", async () 
   try {
     await client.connect(transport);
     const { tools } = await client.listTools();
+    const searchSchema = tools.find((tool) => tool.name === "booking_search").inputSchema;
+    assert.ok(searchSchema.properties.sortBy.enum.includes("price_asc"));
+    assert.equal(searchSchema.properties.offset.minimum, 0);
+    assert.equal(searchSchema.properties.maxResults.maximum, 50);
+    assert.equal(searchSchema.properties.searchId.type, "string");
+    for (const name of ["booking_filter_results", "booking_sort_results"]) {
+      assert.equal(tools.find((tool) => tool.name === name).inputSchema.properties.searchId.type, "string");
+      const result = await client.callTool({ name,
+        arguments: { searchId: "missing", ...(name === "booking_sort_results" ? { sortBy: "price_asc" } : {}) },
+      });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /expired searchId/);
+    }
     for (const name of ["booking_search", "booking_check_availability",
       "booking_get_prices", "booking_book"]) {
       const schema = tools.find((tool) => tool.name === name).inputSchema;
@@ -22,6 +35,13 @@ test("MCP exposes child ages and forwards occupancy to booking links", async () 
     }
 
     const dates = { checkIn: "2026-10-31", checkOut: "2026-11-01" };
+    for (const options of [{ offset: -1 }, { sortBy: "unknown" }, { maxResults: 0 }]) {
+      const result = await client.callTool({
+        name: "booking_search",
+        arguments: { destination: "Rimini", ...dates, ...options },
+      });
+      assert.equal(result.isError, true);
+    }
     const propertyUrl = "https://www.booking.com/hotel/it/example.html" +
       "?group_children=1&age=0&req_age=0&checkin=2026-01-01";
     for (const occupancy of [{ childAges: [9] }, { children: 1, childAges: [9] },

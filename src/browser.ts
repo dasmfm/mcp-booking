@@ -5,11 +5,19 @@
  */
 
 import { chromium, Browser, BrowserContext, Page } from "patchright";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { applyChildren, validateChildren } from "./occupancy.js";
 import {
-  saveCookies,
+  applySearchOptions, uniqueSearchResults, type SearchSort,
+} from "./search.js";
+import { loadSearchResults } from "./search-pagination.js";
+import { SearchSessions } from "./search-sessions.js";
+import { BrowserLifecycle } from "./browser-lifecycle.js";
+import {
+  saveCookies as persistCookies,
   loadCookies,
   saveSessionInfo,
+  clearAuthData,
   type SessionInfo,
 } from "./auth.js";
 
@@ -87,6 +95,26 @@ let page: Page | null = null;
 
 // In-memory search results cache for filter/sort operations
 let lastSearchResults: PropertyResult[] = [];
+type BrowserLease = { browser: Browser; context: BrowserContext; page: Page };
+const toolPage = new AsyncLocalStorage<BrowserLease>();
+let browserInitialization: Promise<BrowserLease> | undefined;
+const browserLifecycle = new BrowserLifecycle();
+async function saveCookies(context: BrowserContext): Promise<void> {
+  await persistCookies(context, () => browserLifecycle.canPersist(context));
+}
+const searchSessions = new SearchSessions<Page, PropertyResult>(async () => {
+  const { context } = await initBrowser();
+  browserLifecycle.assertAvailable();
+  const searchPage = await context.newPage();
+  try {
+    browserLifecycle.assertAvailable();
+    await applyStealth(searchPage);
+    return searchPage;
+  } catch (error) {
+    await searchPage.close();
+    throw error;
+  }
+});
 
 /** Random delay between 500-2000ms for human-like behaviour */
 async function randomDelay(min = 500, max = 2000): Promise<void> {
@@ -191,7 +219,38 @@ async function applyStealth(p: Page): Promise<void> {
   });
 }
 
-async function initBrowser(): Promise<{
+async function initBrowser(): Promise<BrowserLease> {
+  browserLifecycle.assertAvailable();
+  const lease = toolPage.getStore();
+  if (lease) return lease;
+  if (browser && context && page) return { browser, context, page };
+  if (!browserInitialization) {
+    browserInitialization = initializeBrowser().finally(() => {
+      browserInitialization = undefined;
+    });
+  }
+  return browserInitialization;
+}
+
+/** Isolate property tools while allowing nested calls (prices/availability) to share a tab. */
+export async function withIsolatedToolPage<T>(
+  needsPage: boolean,
+  work: () => Promise<T>
+): Promise<T> {
+  if (!needsPage) return work();
+  const shared = await initBrowser();
+  browserLifecycle.assertAvailable();
+  const isolatedPage = await shared.context.newPage();
+  try {
+    browserLifecycle.assertAvailable();
+    await applyStealth(isolatedPage);
+    return await toolPage.run({ ...shared, page: isolatedPage }, work);
+  } finally {
+    if (!isolatedPage.isClosed()) await isolatedPage.close();
+  }
+}
+
+async function initializeBrowser(): Promise<{
   browser: Browser;
   context: BrowserContext;
   page: Page;
@@ -231,15 +290,7 @@ async function initBrowser(): Promise<{
  * Close browser and save state
  */
 export async function closeBrowser(): Promise<void> {
-  if (context) {
-    await saveCookies(context);
-  }
-  if (browser) {
-    await browser.close();
-    browser = null;
-    context = null;
-    page = null;
-  }
+  return shutdownBrowser(true);
 }
 
 /**
@@ -248,16 +299,34 @@ export async function closeBrowser(): Promise<void> {
  * the (logged-out) cookie jar of the headless singleton on shutdown.
  */
 async function resetBrowser(): Promise<void> {
-  if (browser) {
+  return shutdownBrowser(false);
+}
+
+function shutdownBrowser(persist: boolean): Promise<void> {
+  return browserLifecycle.close(() => drainBrowser(persist));
+}
+
+/**
+ * Called only while the full lifecycle gate is held (never enqueue a nested close).
+ * Search queues and in-flight initialization are drained before retiring context.
+ * Temporary detail tabs are not drained: browser.close() interrupts their work.
+ * Retirement also prevents pending cookie reads from publishing after shutdown.
+ */
+async function drainBrowser(persist: boolean): Promise<void> {
     try {
-      await browser.close();
-    } catch {
-      // ignore
+      await searchSessions.closeAll();
+      if (browserInitialization) await browserInitialization;
+      if (persist && context) await saveCookies(context);
+    } finally {
+      if (context) browserLifecycle.retire(context);
+      try {
+        if (browser) await browser.close();
+      } finally {
+        browser = null;
+        context = null;
+        page = null;
+      }
     }
-  }
-  browser = null;
-  context = null;
-  page = null;
 }
 
 /**
@@ -407,6 +476,8 @@ let loginContext: BrowserContext | null = null;
 let loginPage: Page | null = null;
 let loginPollTimer: ReturnType<typeof setInterval> | null = null;
 let loginPolling = false; // re-entrancy guard for the async interval callback
+let loginRevision = 0;
+let loginAttemptRevision = 0;
 
 let loginProgress: LoginProgress = {
   status: "idle",
@@ -415,7 +486,7 @@ let loginProgress: LoginProgress = {
 };
 
 /** Close/clear the interactive login window and its background poller. */
-async function tearDownLoginBrowser(): Promise<void> {
+async function tearDownLoginBrowser(resetHeadless: boolean = true): Promise<void> {
   if (loginPollTimer) {
     clearInterval(loginPollTimer);
     loginPollTimer = null;
@@ -428,7 +499,21 @@ async function tearDownLoginBrowser(): Promise<void> {
   loginPage = null;
   // Reset the headless singleton so the next operation reloads the freshly
   // captured cookies (without overwriting them via closeBrowser's save-on-close).
-  await resetBrowser();
+  if (resetHeadless) await resetBrowser();
+}
+
+/** Cancel pending login publication and clear auth while all browser work is gated. */
+export async function logoutBrowser(): Promise<void> {
+  loginRevision++;
+  await browserLifecycle.exclusive(async () => {
+    await drainBrowser(false);
+    await tearDownLoginBrowser(false);
+    clearAuthData();
+    loginProgress = {
+      status: "idle", isLoggedIn: false,
+      message: "Logged out. Call booking_login to sign in again.",
+    };
+  });
 }
 
 /** Record the terminal outcome of a login attempt and tear the window down. */
@@ -456,7 +541,9 @@ async function finishLogin(
 async function pollLoginOnce(): Promise<void> {
   if (loginPolling) return;
   loginPolling = true;
+  const revision = loginAttemptRevision;
   try {
+    if (revision !== loginRevision) return;
     if (loginProgress.status !== "in_progress") return;
 
     // User closed the window before completing sign-in.
@@ -483,9 +570,18 @@ async function pollLoginOnce(): Promise<void> {
     const currentUrl = loginPage.url();
     const urlSignalsAuth = /[?&]auth_success=1\b/.test(currentUrl);
     if (urlSignalsAuth || (await detectLoggedIn(loginPage))) {
+      if (revision !== loginRevision) return;
       if (loginContext) {
-        await saveCookies(loginContext);
+        const authenticatedContext = loginContext;
+        // Drain even in-flight initialization before publishing fresh credentials.
+        // Keep the gate held through persistence so no context can load old cookies.
+        await browserLifecycle.exclusive(async () => {
+          if (revision !== loginRevision) return;
+          await drainBrowser(false);
+          await persistCookies(authenticatedContext, () => revision === loginRevision);
+        });
       }
+      if (revision !== loginRevision) return;
       let userEmail: string | undefined;
       try {
         const emailEl = await loginPage.$(
@@ -495,6 +591,7 @@ async function pollLoginOnce(): Promise<void> {
       } catch {
         // best-effort only
       }
+      if (revision !== loginRevision) return;
       await finishLogin(
         "success",
         `Login successful${
@@ -521,6 +618,15 @@ async function pollLoginOnce(): Promise<void> {
 export async function startLogin(
   timeoutMs: number = 600000
 ): Promise<LoginProgress> {
+  browserLifecycle.assertAvailable();
+  let result: LoginProgress | undefined;
+  await browserLifecycle.exclusive(async () => {
+    result = await openLogin(timeoutMs);
+  });
+  return result!;
+}
+
+async function openLogin(timeoutMs: number): Promise<LoginProgress> {
   // Already running — don't open a second window.
   if (
     loginProgress.status === "in_progress" &&
@@ -532,7 +638,9 @@ export async function startLogin(
   }
 
   // Clean up any stale handles from a prior attempt.
-  await tearDownLoginBrowser();
+  loginAttemptRevision = ++loginRevision;
+  await tearDownLoginBrowser(false);
+  await drainBrowser(false);
 
   try {
     loginBrowser = await chromium.launch({
@@ -595,7 +703,7 @@ export async function startLogin(
       await dismissBanners(loginPage);
     }
   } catch (error) {
-    await tearDownLoginBrowser();
+    await tearDownLoginBrowser(false);
     loginProgress = {
       status: "failed",
       isLoggedIn: false,
@@ -646,10 +754,18 @@ export async function searchProperties(
   amenities?: string[],
   rawNflt?: string,
   flexWindow: number = 0,
-  childAges?: number[]
-): Promise<PropertyResult[]> {
+  childAges?: number[],
+  sortBy?: SearchSort,
+  offset: number = 0,
+  searchId?: string
+): Promise<{ searchId: string; properties: PropertyResult[] }> {
+  browserLifecycle.assertAvailable();
   validateChildren(children, childAges);
-  const { page, context } = await initBrowser();
+  if (!Number.isSafeInteger(maxResults) || maxResults < 1 || maxResults > 50) {
+    throw new Error("maxResults must be an integer from 1 to 50");
+  }
+  const searchOptions = new URLSearchParams();
+  applySearchOptions(searchOptions, sortBy, offset);
 
   try {
     // Build search URL
@@ -661,6 +777,10 @@ export async function searchProperties(
       lang: "en-us",
     });
     applyChildren(params, children, childAges);
+    for (const [key, value] of searchOptions) params.set(key, value);
+    // Text destination searches ignore URL offsets in the current Booking.com UI.
+    // A new search loads the sorted feed from its start, then slices by offset.
+    params.set("offset", "0");
 
     // Apply flexible-date window (Android-app-style ±N days).
     if (flexWindow > 0) {
@@ -690,32 +810,36 @@ export async function searchProperties(
     }
 
     const searchUrl = `${BOOKING_BASE_URL}/searchresults.html?${params.toString()}`;
-    await page.goto(searchUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: DEFAULT_TIMEOUT,
-    });
-    await randomDelay();
-    await dismissBanners(page);
+    return await searchSessions.run(searchUrl, searchId, async (session) => {
+    const page = session.page;
+    if (!session.initialized) {
+      await page.goto(searchUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: DEFAULT_TIMEOUT,
+      });
+      await randomDelay();
+      await dismissBanners(page);
 
-    // Wait for results
-    await page
-      .waitForSelector(
-        '[data-testid="property-card"], [data-testid="property-card-container"]',
-        { timeout: 15000 }
-      )
-      .catch(() => {});
+      // Wait for results on a fresh search; continuation already has cards.
+      await page
+        .waitForSelector(
+          '[data-testid="property-card"], [data-testid="property-card-container"]',
+          { timeout: 15000 }
+        )
+        .catch(() => {});
 
-    await randomDelay(500, 1000);
+      await randomDelay(500, 1000);
+      session.initialized = true;
+    }
 
-    const results = await page.evaluate((max: number) => {
+    await loadSearchResults(page, offset + maxResults);
+    const rawResults = await page.evaluate(() => {
       const cards = document.querySelectorAll(
         '[data-testid="property-card"], [data-testid="property-card-container"]'
       );
       const out: PropertyResult[] = [];
 
       cards.forEach((card, i) => {
-        if (i >= max) return;
-
         const nameEl = card.querySelector(
           '[data-testid="title"], [data-testid="property-card-name"], .sr-hotel__name'
         );
@@ -792,11 +916,14 @@ export async function searchProperties(
       });
 
       return out;
-    }, maxResults) as PropertyResult[];
+    }) as PropertyResult[];
+    const results = uniqueSearchResults(rawResults, offset + maxResults).slice(offset);
 
+    const sharedContext = page.context();
+    await saveCookies(sharedContext);
     lastSearchResults = results;
-    await saveCookies(context);
     return results;
+    });
   } catch (error) {
     throw new Error(
       `Failed to search properties: ${
@@ -1319,8 +1446,8 @@ export function filterResults(filters: {
   breakfastIncluded?: boolean;
   stars?: number;
   keyword?: string;
-}): PropertyResult[] {
-  let results = [...lastSearchResults];
+}, searchId?: string): PropertyResult[] {
+  let results = searchId === undefined ? [...lastSearchResults] : searchSessions.getResults(searchId);
 
   if (filters.minPrice !== undefined) {
     results = results.filter(
@@ -1366,9 +1493,10 @@ export function filterResults(filters: {
  * Sort cached search results
  */
 export function sortResults(
-  sortBy: "price_asc" | "price_desc" | "rating" | "distance" | "reviews"
+  sortBy: "price_asc" | "price_desc" | "rating" | "distance" | "reviews",
+  searchId?: string
 ): PropertyResult[] {
-  const results = [...lastSearchResults];
+  const results = searchId === undefined ? [...lastSearchResults] : searchSessions.getResults(searchId);
 
   switch (sortBy) {
     case "price_asc":

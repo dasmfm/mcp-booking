@@ -32,8 +32,12 @@ import {
   getPropertyReviews,
   closeBrowser,
   SUPPORTED_AMENITIES,
+  withIsolatedToolPage,
+  logoutBrowser,
 } from "./browser.js";
-import { loadSessionInfo, clearAuthData, getConfigDir } from "./auth.js";
+import { loadSessionInfo, getConfigDir } from "./auth.js";
+import { MAX_SEARCH_OFFSET, SEARCH_SORT_ORDERS, searchPagination, type SearchSort } from "./search.js";
+import { validateChildren } from "./occupancy.js";
 
 const CHILD_PROPERTIES = {
   children: {
@@ -153,8 +157,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             ...CHILD_PROPERTIES,
             maxResults: {
-              type: "number",
-              description: "Maximum results to return (default: 10, max: 50)",
+              type: "integer",
+              minimum: 1,
+              maximum: 50,
+              description: "Maximum unique properties to return (default: 10, max: 50). Loads more results as needed to reach offset + maxResults.",
+            },
+            sortBy: {
+              type: "string",
+              enum: Object.keys(SEARCH_SORT_ORDERS),
+              description: "Sort on Booking.com BEFORE fetching results. price_asc requests cheapest first; unlike booking_sort_results, this is not local sorting.",
+            },
+            offset: {
+              type: "integer",
+              minimum: 0,
+              maximum: MAX_SEARCH_OFFSET,
+              description: "Number of unique properties to skip in the sorted Booking.com feed (default: 0, max: 1000). Loads more results by scrolling as needed. Use nextOffset with the same search criteria for the next batch.",
+            },
+            searchId: {
+              type: "string",
+              description: "Search session ID returned by a previous booking_search. Reuses that search's tab with the same criteria and a new offset. Omit to start an independent search. Sessions expire after 10 idle minutes; at most 8 are retained.",
             },
             amenities: {
               type: "array",
@@ -280,6 +301,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
+            searchId: {
+              type: "string",
+              description: "Filter the latest batch of this search session. Omit for the most recently completed search (ambiguous with parallel searches).",
+            },
             minPrice: {
               type: "number",
               description: "Minimum price per night",
@@ -318,6 +343,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
+            searchId: {
+              type: "string",
+              description: "Sort the latest batch of this search session. Omit for the most recently completed search (ambiguous with parallel searches).",
+            },
             sortBy: {
               type: "string",
               enum: ["price_asc", "price_desc", "rating", "distance", "reviews"],
@@ -448,6 +477,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    if (["booking_search", "booking_check_availability", "booking_get_prices", "booking_book"].includes(name)) {
+      validateChildren(args?.children as number | undefined, args?.childAges as number[] | undefined);
+    }
+    const needsPage = [
+      "booking_status", "booking_get_property", "booking_check_availability",
+      "booking_get_prices", "booking_get_reviews", "booking_save_property",
+      "booking_get_reservations",
+    ].includes(name) || (name === "booking_book" && args?.advanceToCheckout === true) ||
+      (name === "booking_cancel_reservation" && args?.confirm === true);
+    return await withIsolatedToolPage(needsPage, async () => {
     switch (name) {
       case "booking_status": {
         const sessionInfo = loadSessionInfo();
@@ -517,8 +556,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "booking_logout": {
-        clearAuthData();
-        await closeBrowser();
+        await logoutBrowser();
 
         return {
           content: [
@@ -546,6 +584,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           amenities,
           rawNflt,
           flex_window = 0,
+          sortBy,
+          offset = 0,
+          searchId,
         } = args as {
           destination: string;
           checkIn: string;
@@ -558,21 +599,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           amenities?: string[];
           rawNflt?: string;
           flex_window?: number;
+          sortBy?: SearchSort;
+          offset?: number;
+          searchId?: string;
         };
 
-        const properties = await searchProperties(
+        const search = await searchProperties(
           destination,
           checkIn,
           checkOut,
           adults,
           rooms,
           children,
-          Math.min(maxResults, 50),
+          maxResults,
           amenities,
           rawNflt,
           flex_window,
-          childAges
+          childAges,
+          sortBy,
+          offset,
+          searchId
         );
+        const { properties } = search;
 
         return {
           content: [
@@ -582,12 +630,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   success: true,
                   destination,
+                  searchId: search.searchId,
                   checkIn,
                   checkOut,
                   adults,
                   rooms,
                   children: children ?? childAges?.length ?? 0,
                   childAges,
+                  sortBy,
+                  offset,
+                  ...searchPagination(offset, properties.length),
                   amenities: amenities && amenities.length ? amenities : undefined,
                   flex_window: flex_window || undefined,
                   count: properties.length,
@@ -716,7 +768,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "booking_filter_results": {
-        const filters = args as {
+        const { searchId, ...filters } = args as {
+          searchId?: string;
           minPrice?: number;
           maxPrice?: number;
           minRating?: number;
@@ -726,7 +779,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           keyword?: string;
         };
 
-        const filtered = filterResults(filters);
+        const filtered = filterResults(filters, searchId);
 
         return {
           content: [
@@ -736,6 +789,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   success: true,
                   filters,
+                  searchId,
                   count: filtered.length,
                   properties: filtered,
                 },
@@ -748,7 +802,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "booking_sort_results": {
-        const { sortBy } = args as {
+        const { sortBy, searchId } = args as {
+          searchId?: string;
           sortBy:
             | "price_asc"
             | "price_desc"
@@ -757,7 +812,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             | "reviews";
         };
 
-        const sorted = sortResults(sortBy);
+        const sorted = sortResults(sortBy, searchId);
 
         return {
           content: [
@@ -767,6 +822,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   success: true,
                   sortBy,
+                  searchId,
                   count: sorted.length,
                   properties: sorted,
                 },
@@ -922,6 +978,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           isError: true,
         };
     }
+    });
   } catch (error) {
     const errorMessage =
       error instanceof Error ? error.message : String(error);
